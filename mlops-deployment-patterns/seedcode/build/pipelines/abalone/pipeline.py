@@ -8,7 +8,9 @@
 
 Implements a get_pipeline(**kwargs) method.
 """
+import json
 import os
+import re
 
 import boto3
 import sagemaker
@@ -23,17 +25,19 @@ from sagemaker.model_metrics import (
 from sagemaker.processing import (
     ProcessingInput,
     ProcessingOutput,
+    Processor,
     ScriptProcessor,
 )
-from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.workflow.conditions import ConditionLessThanOrEqualTo
 from sagemaker.workflow.condition_step import (
     ConditionStep,
 )
 from sagemaker.workflow.functions import (
+    Join,
     JsonGet,
 )
 from sagemaker.workflow.parameters import (
+    ParameterBoolean,
     ParameterInteger,
     ParameterString,
 )
@@ -120,6 +124,61 @@ def get_pipeline_custom_tags(new_tags, region, sagemaker_project_arn=None):
     return new_tags
 
 
+def read_flow(filename):
+    with open(filename, "r") as f:
+        return json.loads(f.read())
+
+
+def filter_string(s):
+    return "-".join(re.findall(r"[a-zA-Z0-9!.*'()_-]+", s))
+
+
+def get_destination_node_output_names(flow):
+    output_names = []
+    for node in flow["nodes"]:
+        if node["type"] == "DESTINATION":
+            output_names.append(
+                (filter_string(node["name"]), f"{node['node_id']}.{node['outputs'][0]['name']}")
+            )
+    return output_names
+
+
+def create_processing_job_outputs(flow, s3_output_base_path):
+    output_names = get_destination_node_output_names(flow)
+    processing_outputs = []
+    for dataset_name, output_name in output_names:
+        processing_outputs.append(
+            ProcessingOutput(
+                output_name=output_name,
+                source=f"/opt/ml/processing/output/{dataset_name}",
+                destination=os.path.join(s3_output_base_path, dataset_name),
+                s3_upload_mode="EndOfJob"
+            )
+        )
+    return processing_outputs, output_names
+
+
+def upload_flow(filename, bucket, key, region):
+    boto_session = boto3.Session(region_name=region)
+    s3_client = boto_session.client("s3")
+    s3_client.upload_file(filename, bucket, key, ExtraArgs={"ServerSideEncryption": "aws:kms"})
+    return f"s3://{bucket}/{key}"
+
+
+def create_parameter_override_args(parameter_overrides):
+    """Create PJ args from parameter overrides.
+    
+    Args:
+        parameter_overrides: a mapping of parameter name to Pipeline Parameter object
+
+    Returns: list of `--parameter-override` container arguments
+    """
+    return [
+        Join(on="", values=[f"--parameter-override '{{\"{name}\": \"", value, "\"}'"])
+        for name, value in parameter_overrides.items()
+    ]
+
+
 def get_pipeline(
     region,
     sagemaker_project_arn=None,
@@ -156,36 +215,117 @@ def get_pipeline(
         name="InputDataUrl",
         default_value=f"s3://sagemaker-servicecatalog-seedcode-{region}/dataset/abalone-dataset.csv",
     )
+    refit_flow = ParameterBoolean(name="RefitFlow", default_value=False)
 
     # processing step for feature engineering
-    sklearn_processor = SKLearnProcessor(
-        framework_version="0.23-1",
-        instance_type=processing_instance_type,
-        instance_count=processing_instance_count,
-        base_job_name=f"{base_job_prefix}/sklearn-abalone-preprocess",
-        sagemaker_session=pipeline_session,
+
+    # read the flow file
+    flow_file_name = "preprocess.flow"
+    flow_file = os.path.join(BASE_DIR, flow_file_name)
+    flow = read_flow(flow_file)
+
+    # create processing outputs for each destination in the flow
+    s3_output_base_path = f"s3://{sagemaker_session.default_bucket()}/data-wrangler-outputs/abalone/"
+    processing_job_outputs, output_names = create_processing_job_outputs(flow, s3_output_base_path)
+
+    # get output names for train, validation, test sets
+    train_output_name = [output_name[1] for output_name in output_names if "train" in output_name[0].lower()][0]
+    validation_output_name = [output_name[1] for output_name in output_names if "validation" in output_name[0].lower()][0]
+    test_output_name = [output_name[1] for output_name in output_names if "test" in output_name[0].lower()][0]
+
+    # create processing input for flow file
+    flow_s3_uri = upload_flow(flow_file, sagemaker_session.default_bucket(), "data-wrangler-flows/preprocess.flow", region)
+
+    flow_input = ProcessingInput(
+        source=flow_s3_uri,
+        destination="/opt/ml/processing/flow",
+        input_name="flow",
+        s3_data_type="S3Prefix",
+        s3_input_mode="File",
+        s3_data_distribution_type="FullyReplicated",
+    )
+
+    # Latest Data Wrangler Container URI
+    container_uri = "174368400705.dkr.ecr.us-west-2.amazonaws.com/sagemaker-data-wrangler-container:2.x"
+
+    # Size in GB of the EBS volume to use for storing data during processing.
+    volume_size_in_gb = 30
+
+    # KMS key for per object encryption; default is None.
+    kms_key = None
+
+    # List of tags to be passed to the processing job.
+    user_tags = []
+
+    # Content type for each output.
+    output_content_type = "CSV"
+
+    # Delimiter to use for the output if the output content type is CSV. Uncomment to set.
+    # delimiter = ","
+
+    # Compression to use for the output. Uncomment to set.
+    # compression = "gzip"
+
+    # Configuration for partitioning the output. Uncomment to set.
+    # "num_partition" sets the number of partitions/files written in the output.
+    # "partition_by" sets the column names to partition the output by.
+    # partition_config = {
+    #     "num_partitions": 1,
+    #     "partition_by": ["column_name_1", "column_name_2"],
+    # }
+
+    # Output configuration used as processing job container arguments. Only applies when writing to S3.
+    # Uncomment to set additional configurations.
+    output_configs = [{
+        output_name[1]: {
+            "content_type": output_content_type,
+            # "delimiter": delimiter,
+            # "compression": compression,
+            # "partition_config": partition_config,
+        }
+    } for output_name in output_names]
+
+    # Refit configuration determines whether Data Wrangler refits the trainable parameters on the entire dataset.
+    # When True, the processing job relearns the parameters and outputs a new flow file.
+    # You can specify the name of the output flow file under 'output_flow'.
+    # Note: There are length constraints on the container arguments (max 256 characters).
+    # refit_trained_params = {"refit": refit_flow}
+
+    # Overridable parameters. Set new values here to change the behavior of the processing job.
+    parameter_overrides = {
+        'InputDataUrl': input_data,
+    }
+
+    parameter_override_args = create_parameter_override_args(parameter_overrides)
+
+    processor = Processor(
         role=role,
+        image_uri=container_uri,
+        instance_count=processing_instance_count,
+        instance_type=processing_instance_type,
+        volume_size_in_gb=volume_size_in_gb,
+        sagemaker_session=sagemaker_session,
+        output_kms_key=kms_key,
+        tags=user_tags
     )
-    step_args = sklearn_processor.run(
-        outputs=[
-            ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
-            ProcessingOutput(output_name="validation", source="/opt/ml/processing/validation"),
-            ProcessingOutput(output_name="test", source="/opt/ml/processing/test"),
-        ],
-        code=os.path.join(BASE_DIR, "preprocess.py"),
-        arguments=["--input-data", input_data],
-    )
-    step_process = ProcessingStep(
-        name="PreprocessAbaloneData",
-        step_args=step_args,
+
+    step_data_wrangler = ProcessingStep(
+        name="DataWranglerProcessingStep",
+        processor=processor,
+        inputs=[flow_input],
+        outputs=processing_job_outputs,
+        job_arguments=[f"--output-config '{json.dumps(output_config)}'" for output_config in output_configs]
+            + [Join(on="", values=[f"--refit-trained-params '{{\"refit\": ", refit_flow, f", \"output_flow\": \"{flow_file_name}\"}}'"])]
+            + create_parameter_override_args(parameter_overrides)
     )
 
     # training step for generating model artifacts
+    algo_content_type = "text/csv"
     model_path = f"s3://{sagemaker_session.default_bucket()}/{base_job_prefix}/AbaloneTrain"
     image_uri = sagemaker.image_uris.retrieve(
         framework="xgboost",
         region=region,
-        version="1.0-1",
+        version="1.5-1",
         py_version="py3",
         instance_type=training_instance_type,
     )
@@ -206,21 +346,28 @@ def get_pipeline(
         gamma=4,
         min_child_weight=6,
         subsample=0.7,
-        silent=0,
     )
     step_args = xgb_train.fit(
         inputs={
             "train": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
-                    "train"
-                ].S3Output.S3Uri,
-                content_type="text/csv",
+                s3_data=Join(
+                    on="/",
+                    values=[
+                        step_data_wrangler.properties.ProcessingOutputConfig.Outputs[train_output_name].S3Output.S3Uri,
+                        step_data_wrangler.properties.ProcessingJobName,
+                    ]
+                ),
+                content_type=algo_content_type,
             ),
             "validation": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
-                    "validation"
-                ].S3Output.S3Uri,
-                content_type="text/csv",
+                s3_data=Join(
+                    on="/",
+                    values=[
+                        step_data_wrangler.properties.ProcessingOutputConfig.Outputs[validation_output_name].S3Output.S3Uri,
+                        step_data_wrangler.properties.ProcessingJobName,
+                    ]
+                ),
+                content_type=algo_content_type,
             ),
         },
     )
@@ -246,9 +393,13 @@ def get_pipeline(
                 destination="/opt/ml/processing/model",
             ),
             ProcessingInput(
-                source=step_process.properties.ProcessingOutputConfig.Outputs[
-                    "test"
-                ].S3Output.S3Uri,
+                source=Join(
+                    on="/",
+                    values=[
+                        step_data_wrangler.properties.ProcessingOutputConfig.Outputs[test_output_name].S3Output.S3Uri,
+                        step_data_wrangler.properties.ProcessingJobName,
+                    ]
+                ),
                 destination="/opt/ml/processing/test",
             ),
         ],
@@ -322,8 +473,9 @@ def get_pipeline(
             training_instance_type,
             model_approval_status,
             input_data,
+            refit_flow,
         ],
-        steps=[step_process, step_train, step_eval, step_cond],
+        steps=[step_data_wrangler, step_train, step_eval, step_cond],
         sagemaker_session=pipeline_session,
     )
     return pipeline
