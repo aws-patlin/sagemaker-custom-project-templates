@@ -1,6 +1,7 @@
 """Evaluation script for measuring mean squared error."""
 import json
 import logging
+import os
 import pathlib
 import pickle
 import tarfile
@@ -24,11 +25,16 @@ if __name__ == "__main__":
         tar.extractall(path=".")
 
     logger.debug("Loading xgboost model.")
-    model = pickle.load(open("xgboost-model", "rb"))
+    model = xgboost.Booster()
+    model.load_model("xgboost-model")
 
     logger.debug("Reading test data.")
-    test_path = "/opt/ml/processing/test/test.csv"
-    df = pd.read_csv(test_path, header=None)
+    for root, dirs, files in os.walk("/opt/ml/processing/test/"):
+        for file in files:
+            if file.endswith(".csv"):
+                test_path = os.path.join(root, file)
+                break
+    df = pd.read_csv(test_path)
 
     logger.debug("Reading test data.")
     y_test = df.iloc[:, 0].to_numpy()
